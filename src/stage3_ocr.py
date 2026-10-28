@@ -1,234 +1,626 @@
-"""
-Stage 3 — Batch/Expiry OCR Cross-Verification
-------------------------------------------------
-Reads printed text off a medicine package image (batch number, expiry date,
-manufacturing date) using EasyOCR, then extracts structured fields using
-pattern matching.
-
-Usage (standalone test):
-    py -3.12 src/stage3_ocr.py path/to/image.jpg
-
-Usage (as a module, from app.py or fusion.py):
-    from stage3_ocr import run_ocr_check
-    result = run_ocr_check("path/to/image.jpg")
-"""
 
 import re
-import sys
-from datetime import datetime
+import calendar
+import time
+from datetime import date, datetime
+from functools import lru_cache
+from image_preprocessing import prepare_image_for_ocr
 
+import cv2
 import easyocr
-
-# ---------------------------------------------------------------------------
-# EasyOCR reader is expensive to initialize (loads detection + recognition
-# models), so we create it ONCE at module load and reuse it — never create
-# a new easyocr.Reader() inside a loop or per-request in the Streamlit app.
-# ---------------------------------------------------------------------------
-_reader = None
+import torch
 
 
+# ============================================================
+# MEDGUARD OCR ENGINE
+# ============================================================
+
+# Reader is cached so it is not recreated on every analysis.
+# GPU is used only when the installed PyTorch supports CUDA.
+@lru_cache(maxsize=1)
 def get_reader():
-    """Lazily initialize and cache the EasyOCR reader (English only, CPU)."""
-    global _reader
-    if _reader is None:
-        # gpu=False because most dev/demo machines won't have a CUDA GPU set up.
-        # Set gpu=True later if you train/run on a CUDA-enabled machine.
-        _reader = easyocr.Reader(["en"], gpu=False)
-    return _reader
+    use_gpu = torch.cuda.is_available()
+
+    print(
+        f"[MedGuard OCR] Initializing EasyOCR "
+        f"(GPU={'enabled' if use_gpu else 'disabled'})..."
+    )
+
+    start = time.perf_counter()
+
+    reader = easyocr.Reader(
+        ["en"],
+        gpu=use_gpu,
+        verbose=False,
+    )
+
+    print(
+        f"[MedGuard OCR] Reader initialized in "
+        f"{time.perf_counter() - start:.1f}s"
+    )
+
+    return reader
 
 
-# ---------------------------------------------------------------------------
-# Regex patterns for common Indian medicine packaging text formats.
-# Real packaging is inconsistent, so these are deliberately loose/multiple
-# patterns rather than one strict format. Extend this list as you test more
-# real packages from your tablet_pack dataset.
-# ---------------------------------------------------------------------------
-BATCH_PATTERNS = [
-    # Requires "Batch"/"B.No"/"Lot" as a whole word BEFORE the captured value,
-    # so it can no longer match a substring of the label word itself (the
-    # "atch" bug). \b enforces a real word boundary.
-    r"\bBatch\s*No\.?\s*[:\-]?\s*([A-Z0-9]{4,12})\b",
-    r"\bB\.?\s?No\.?\s*[:\-]?\s*([A-Z0-9]{4,12})\b",
-    r"\bBatch\s*[:\-]\s*([A-Z0-9]{4,12})\b",
-    r"\bLot\s*(?:No\.?)?\s*[:\-]?\s*([A-Z0-9]{4,12})\b",
-]
+# ============================================================
+# IMAGE LOADING
+# ============================================================
 
-# Matches dates like: 05/2027, 05-2027, MAY 2027, MAY2027, 05/27,
-# and OCR-mangled spaced-out versions like "OC T 23" -> we normalize
-# whitespace inside month abbreviations before matching (see _normalize_text).
-EXPIRY_PATTERNS = [
-    r"Exp(?:iry)?\.?\s*(?:Date)?\s*[:\-]?\s*(\d{1,2}[\/\-]\d{2,4})",
-    r"Exp(?:iry)?\.?\s*(?:Date)?\s*[:\-]?\s*([A-Za-z]{3,9}\s?\d{2,4})",
-    r"EXP\s*[:\-]?\s*(\d{1,2}[\/\-]\d{2,4})",
-    r"EXP\s*[:\-]?\s*([A-Za-z]{3,9}\s?\d{2,4})",
-    # fallback: bare "MONTH YY/YYYY" appearing anywhere near the word Exp
-    r"Exp[^A-Za-z0-9]{0,15}([A-Za-z]{3,9}\s?\d{2,4})",
-]
+def load_image(image_path):
+    """Read and validate the uploaded image."""
+    image = cv2.imread(image_path)
 
-MFG_PATTERNS = [
-    r"Mfg\.?\s*(?:Date)?\s*[:\-]?\s*(\d{1,2}[\/\-]\d{2,4})",
-    r"Mfg\.?\s*(?:Date)?\s*[:\-]?\s*([A-Za-z]{3,9}\s?\d{2,4})",
-    r"Mfg[^A-Za-z0-9]{0,15}([A-Za-z]{3,9}\s?\d{2,4})",
-]
+    if image is None:
+        raise ValueError(
+            f"Unable to open image: {image_path}"
+        )
+
+    if len(image.shape) != 3:
+        raise ValueError("The uploaded image is not a valid color image.")
+
+    return image
 
 
-def _normalize_text(text):
+def resize_image(image, max_dimension=1400):
+    """Resize large images without changing their aspect ratio."""
+    height, width = image.shape[:2]
+    longest = max(height, width)
+
+    if longest <= max_dimension:
+        return image
+
+    scale = max_dimension / longest
+
+    return cv2.resize(
+        image,
+        None,
+        fx=scale,
+        fy=scale,
+        interpolation=cv2.INTER_AREA,
+    )
+
+
+# ============================================================
+# OCR QUALITY ESTIMATION
+# ============================================================
+
+MEDICINE_TERMS = (
+    "omnigel",
+    "cipla",
+    "diclofenac",
+    "paracetamol",
+    "ibuprofen",
+    "menthol",
+    "salicylate",
+    "tablet",
+    "capsule",
+    "syrup",
+    "gel",
+    "ointment",
+    "batch",
+    "expiry",
+    "manufacture",
+    "mfg",
+    "mfd",
+    "composition",
+    "dosage",
+    "pharmaceutical",
+)
+
+
+def ocr_quality(text):
     """
-    Clean up common OCR artifacts before running regex matching:
-    - Collapses letter-by-letter spacing inside month abbreviations,
-      e.g. "OC T 23" -> "OCT 23", "SE P 25" -> "SEP 25".
-    - Collapses multiple spaces into one.
-    This is intentionally simple; extend it as you see more real OCR output.
+    Heuristic for choosing between OCR attempts.
+    This is not an OCR confidence score.
     """
-    months = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN",
-              "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"]
-    cleaned = text
-    for m in months:
-        # Rejoin a 3-letter month even if OCR split it with spaces, e.g. "O C T" or "OC T"
-        spaced = r"\s*".join(list(m))
-        cleaned = re.sub(spaced, m, cleaned, flags=re.IGNORECASE)
-    cleaned = re.sub(r"\s+", " ", cleaned).strip()
-    return cleaned
+    if not text:
+        return 0
+
+    normalized = re.sub(
+        r"[^A-Z0-9 ]",
+        " ",
+        text.upper(),
+    )
+
+    words = normalized.split()
+
+    if not words:
+        return 0
+
+    useful_words = sum(
+        1 for word in words
+        if len(word) >= 3 and word.isalpha()
+    )
+
+    medicine_matches = sum(
+        1 for term in MEDICINE_TERMS
+        if term in normalized.lower()
+    )
+
+    return (
+        useful_words
+        + medicine_matches * 8
+    )
 
 
-# Generic "any date-like token" pattern, used as a last-resort fallback when
-# a label (Mfg/Exp) and its value get separated by OCR's reading order —
-# common when EasyOCR reads text by spatial position rather than logical flow.
-GENERIC_DATE_PATTERN = r"\b(\d{1,2}[\/\-]\d{2,4}|[A-Za-z]{3,9}\s?\d{2,4})\b"
-
-
-def _find_all_dates(text):
-    """Return every date-like token found in the text, in order of appearance."""
-    matches = re.findall(GENERIC_DATE_PATTERN, text, re.IGNORECASE)
-    # Filter out obvious false positives that are too short to be a real year
-    return [m for m in matches if any(ch.isdigit() for ch in m)]
-
-
-def _first_match(patterns, text):
-    """Return the first regex match found across a list of patterns, or None."""
-    for pattern in patterns:
-        match = re.search(pattern, text, re.IGNORECASE)
-        if match:
-            return match.group(1).strip()
-    return None
-
-
-def _try_parse_date(date_str):
-    """
-    Try a handful of common formats to parse an extracted date string.
-    Returns a datetime object if successful, else None.
-    Not exhaustive — real packaging text is messy, so failures are expected
-    and handled gracefully rather than crashing.
-    """
-    if not date_str:
-        return None
-
-    formats_to_try = [
-        "%m/%Y", "%m-%Y", "%m/%y", "%m-%y",
-        "%b %Y", "%B %Y", "%b%Y", "%B%Y",
-        "%b %y", "%B %y", "%b%y", "%B%y",
-        "%d/%m/%Y", "%d-%m-%Y",
-    ]
-    cleaned = date_str.strip().upper().replace("  ", " ")
-    for fmt in formats_to_try:
-        try:
-            return datetime.strptime(cleaned, fmt)
-        except ValueError:
-            continue
-    return None
-
+# ============================================================
+# OCR TEXT EXTRACTION
+# ============================================================
 
 def extract_text(image_path):
     """
-    Run EasyOCR on the image and return the raw detected text, joined into
-    a single string (easier for regex matching than the raw box-by-box list).
+    Run OCR on a resized original image.
+
+    If the result appears weak, make one fallback attempt
+    using a clockwise-rotated image. The EasyOCR reader is cached.
     """
     reader = get_reader()
-    results = reader.readtext(image_path, detail=0)  # detail=0 -> just strings
-    return " ".join(results)
+    image = prepare_image_for_ocr(image_path)
+    image = resize_image(image, max_dimension=1400)
 
+    def recognize(img):
+        results = reader.readtext(
+            img,
+            detail=0,
+            paragraph=False,
+            batch_size=1,
+            workers=0,
+            canvas_size=1400,
+            mag_ratio=1.0,
+            min_size=12,
+        )
+
+        lines = []
+        seen = set()
+
+        for result in results:
+            line = " ".join(str(result).split()).strip()
+
+            if line and line.casefold() not in seen:
+                seen.add(line.casefold())
+                lines.append(line)
+
+        return "\n".join(lines)
+
+    start = time.perf_counter()
+
+    # First attempt: original orientation.
+    text = recognize(image)
+
+    print(
+        f"[MedGuard OCR] First pass: "
+        f"{time.perf_counter() - start:.1f}s"
+    )
+
+    # Retry only if the original result looks weak.
+    if ocr_quality(text) < 12:
+        rotated = cv2.rotate(
+            image,
+            cv2.ROTATE_90_CLOCKWISE,
+        )
+
+        fallback_start = time.perf_counter()
+        fallback_text = recognize(rotated)
+
+        print(
+            f"[MedGuard OCR] Rotation fallback: "
+            f"{time.perf_counter() - fallback_start:.1f}s"
+        )
+
+        if ocr_quality(fallback_text) > ocr_quality(text):
+            text = fallback_text
+
+    return text
+
+
+# ============================================================
+# TEXT NORMALIZATION
+# ============================================================
+
+def normalize_text(text):
+    """Normalize text for searching and field extraction."""
+    text = (text or "").upper()
+
+    replacements = {
+        "EXP1RY": "EXPIRY",
+        "EXP1R": "EXPIR",
+        "MANUFACTUREO": "MANUFACTURED",
+        "MANUFACTURE0": "MANUFACTURED",
+        "BATCH.": "BATCH",
+    }
+
+    for old, new in replacements.items():
+        text = text.replace(old, new)
+
+    text = re.sub(r"[ \t]+", " ", text)
+
+    return text.strip()
+
+
+# ============================================================
+# DATE PARSING
+# ============================================================
+
+DATE_TOKEN = (
+    r"(?:"
+    r"(?:0?[1-9]|1[0-2])\s*[/.-]\s*(?:\d{2}|\d{4})"
+    r"|"
+    r"(?:0?[1-9]|[12]\d|3[01])\s*[/.-]\s*"
+    r"(?:0?[1-9]|1[0-2])\s*[/.-]\s*(?:\d{2}|\d{4})"
+    r"|"
+    r"(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)"
+    r"[A-Z]*\s*[- /.]?\s*(?:\d{2}|\d{4})"
+    r")"
+)
+
+
+def parse_date(value):
+    """
+    Parse common medicine-package dates.
+
+    Month/year dates represent the final day of that month.
+    Numeric day/month/year dates are interpreted as DD/MM/YYYY.
+    """
+    if not value:
+        return None
+
+    cleaned = re.sub(r"\s+", "", value.upper())
+    cleaned = cleaned.replace(".", "/").replace("-", "/")
+
+    formats = [
+        ("%m/%Y", True),
+        ("%m/%y", True),
+        ("%d/%m/%Y", False),
+        ("%d/%m/%y", False),
+        ("%b/%Y", True),
+        ("%B/%Y", True),
+        ("%b/%y", True),
+        ("%B/%y", True),
+        ("%b%Y", True),
+        ("%B%Y", True),
+        ("%b%y", True),
+        ("%B%y", True),
+    ]
+
+    for fmt, month_only in formats:
+        try:
+            parsed = datetime.strptime(cleaned, fmt).date()
+
+            if month_only:
+                last_day = calendar.monthrange(
+                    parsed.year,
+                    parsed.month,
+                )[1]
+
+                return date(
+                    parsed.year,
+                    parsed.month,
+                    last_day,
+                )
+
+            return parsed
+
+        except ValueError:
+            continue
+
+    return None
+
+
+def find_date_tokens(text):
+    """Find distinct date-like strings in OCR text."""
+    matches = re.findall(
+        DATE_TOKEN,
+        text or "",
+        flags=re.IGNORECASE,
+    )
+
+    result = []
+    seen = set()
+
+    for match in matches:
+        key = re.sub(r"\s+", "", match.upper())
+
+        if key not in seen:
+            seen.add(key)
+            result.append(match.strip())
+
+    return result
+
+
+# ============================================================
+# BATCH NUMBER EXTRACTION
+# ============================================================
+
+BATCH_PATTERNS = [
+    r"\b(?:BATCH|LOT)\s*(?:NO|NUMBER)?\s*[:#.-]\s*"
+    r"([A-Z0-9][A-Z0-9/-]{2,19})\b",
+
+    r"\bB\s*NO\s*[:#.-]\s*"
+    r"([A-Z0-9][A-Z0-9/-]{2,19})\b",
+]
+
+
+def extract_batch(text):
+    """Extract a batch number only when a label is present."""
+    for pattern in BATCH_PATTERNS:
+        match = re.search(
+            pattern,
+            text or "",
+            flags=re.IGNORECASE,
+        )
+
+        if not match:
+            continue
+
+        value = match.group(1).strip(" .:-/#")
+        upper_value = value.upper()
+
+        if upper_value in {
+            "MONTH",
+            "YEAR",
+            "NUMBER",
+            "MANUFACTURE",
+            "MANUFACTURING",
+            "DATE",
+            "EXPIRY",
+        }:
+            continue
+
+        return value
+
+    return None
+
+
+# ============================================================
+# EXPIRY AND MANUFACTURING DATES
+# ============================================================
+
+EXPIRY_PATTERNS = [
+    r"\b(?:EXPIRY|EXPIRATION|EXP)\s*(?:DATE)?\s*"
+    r"[:#.-]?\s*(" + DATE_TOKEN + r")",
+
+    r"\bUSE\s*BEFORE\s*[:#.-]?\s*(" + DATE_TOKEN + r")",
+]
+
+
+MFG_PATTERNS = [
+    r"\b(?:MFG|MFD)\s*(?:DATE)?\s*[:#.-]?\s*"
+    r"(" + DATE_TOKEN + r")",
+
+    r"\b(?:MANUFACTURING\s*DATE|DATE\s*OF\s*MANUFACTURE)"
+    r"\s*[:#.-]?\s*(" + DATE_TOKEN + r")",
+]
+
+
+def extract_labeled_date(text, patterns):
+    """Extract a date only when it follows an appropriate label."""
+    for pattern in patterns:
+        match = re.search(
+            pattern,
+            text or "",
+            flags=re.IGNORECASE,
+        )
+
+        if not match:
+            continue
+
+        raw = match.group(1).strip()
+        parsed = parse_date(raw)
+
+        if parsed:
+            return raw, parsed
+
+    return None, None
+
+
+def extract_expiry_rule(text):
+    """
+    Find statements such as:
+    EXPIRY DATE: 24 MONTHS FROM THE MONTH OF MANUFACTURE
+    """
+    patterns = [
+        r"\bEXPIRY\s*(?:DATE)?\s*[:#.-]?\s*"
+        r"(\d{1,3})\s*MONTHS?\s*FROM\s*"
+        r"(?:THE\s*)?MONTH\s*OF\s*MANUFACTURE\b",
+
+        r"\bEXPIRY\s*(?:DATE)?\s*[:#.-]?\s*"
+        r"(\d{1,3})\s*MONTHS?\s*FROM\s*"
+        r"(?:THE\s*)?(?:DATE\s*OF\s*)?MANUFACTURE\b",
+
+        r"\b(\d{1,3})\s*MONTHS?\s*FROM\s*"
+        r"(?:THE\s*)?MONTH\s*OF\s*MANUFACTURE\b",
+    ]
+
+    for pattern in patterns:
+        match = re.search(
+            pattern,
+            text or "",
+            flags=re.IGNORECASE,
+        )
+
+        if match:
+            months = int(match.group(1))
+
+            if 1 <= months <= 120:
+                return months
+
+    return None
+
+
+def extract_mfg_date_near_label(text):
+    """
+    Search near explicit manufacturing-date labels.
+    Do not treat 'Manufactured by' as a date label.
+    """
+    if not text:
+        return None, None
+
+    patterns = [
+        r"\bMONTH\s*AND\s*YEAR\s*OF\s*MANUFACTURE\b",
+        r"\bDATE\s*OF\s*MANUFACTURE\b",
+        r"\bMANUFACTURING\s*DATE\b",
+        r"\bMFG\b",
+        r"\bMFD\b",
+    ]
+
+    today = date.today()
+
+    for pattern in patterns:
+        for match in re.finditer(
+            pattern,
+            text,
+            flags=re.IGNORECASE,
+        ):
+            nearby = text[match.end():match.end() + 45]
+
+            # Avoid interpreting a duration rule as a date.
+            if re.search(
+                r"\b\d{1,3}\s*MONTHS?\s*FROM\b",
+                nearby,
+                flags=re.IGNORECASE,
+            ):
+                continue
+
+            for candidate in find_date_tokens(nearby):
+                parsed = parse_date(candidate)
+
+                # Reject future dates and implausibly old dates.
+                if parsed and date(1980, 1, 1) <= parsed <= today:
+                    return candidate, parsed
+
+    return None, None
+
+
+# ============================================================
+# EXPIRY CALCULATION
+# ============================================================
+
+def add_months_to_date(start_date, months):
+    """Add months while respecting the target month's last day."""
+    month_index = start_date.month - 1 + months
+    year = start_date.year + month_index // 12
+    month = month_index % 12 + 1
+
+    last_day = calendar.monthrange(year, month)[1]
+    day = min(start_date.day, last_day)
+
+    return date(year, month, day)
+
+
+# ============================================================
+# MAIN OCR PIPELINE
+# ============================================================
 
 def run_ocr_check(image_path):
-    """
-    Main entry point for Stage 3.
-
-    Returns a dict:
-        {
-            "raw_text": str,          # everything OCR detected, for debugging
-            "batch_no": str | None,
-            "expiry_raw": str | None,
-            "expiry_parsed": datetime | None,
-            "expired": bool | None,   # True/False if we could parse a date, else None
-            "confidence": float,      # 0.0-1.0, how much we actually found
-        }
-    """
+    """Extract visible package text and return structured fields."""
     raw_text = extract_text(image_path)
-    normalized_text = _normalize_text(raw_text)
+    normalized = normalize_text(raw_text)
 
-    batch_no = _first_match(BATCH_PATTERNS, normalized_text)
-    expiry_raw = _first_match(EXPIRY_PATTERNS, normalized_text)
-    expiry_parsed = _try_parse_date(expiry_raw)
-    used_fallback = False
+    batch_no = extract_batch(normalized)
 
-    # Fallback: if we couldn't find a labeled expiry, scan for any date-like
-    # tokens in the whole text. Packaging conventionally lists Mfg date
-    # before Exp date, so if we find two or more dates, treat the LAST one
-    # as the likely expiry (safer assumption than the first, since expiry
-    # is usually printed after/below manufacturing date).
-    if expiry_parsed is None:
-        all_dates = _find_all_dates(normalized_text)
-        if all_dates:
-            candidate = all_dates[-1]
-            parsed_candidate = _try_parse_date(candidate)
-            if parsed_candidate is not None:
-                expiry_raw = candidate
-                expiry_parsed = parsed_candidate
-                used_fallback = True
+    expiry_raw, expiry_parsed = extract_labeled_date(
+        normalized,
+        EXPIRY_PATTERNS,
+    )
 
+    mfg_raw, mfg_parsed = extract_labeled_date(
+        normalized,
+        MFG_PATTERNS,
+    )
+
+    if not mfg_parsed:
+        mfg_raw, mfg_parsed = extract_mfg_date_near_label(
+            normalized
+        )
+
+    expiry_rule_months = extract_expiry_rule(normalized)
+
+    expiry_used_calculation = False
+    expiry_calculation_note = None
+
+    if (
+        not expiry_parsed
+        and expiry_rule_months
+        and mfg_parsed
+    ):
+        calculated_expiry = add_months_to_date(
+            mfg_parsed,
+            expiry_rule_months,
+        )
+
+        expiry_parsed = calculated_expiry
+        expiry_raw = None
+        expiry_used_calculation = True
+
+        expiry_calculation_note = (
+            f"Calculated using {expiry_rule_months} months "
+            "from the detected manufacturing date. "
+            "Verify against the printed package."
+        )
+
+    if (
+        expiry_rule_months
+        and not mfg_parsed
+        and not expiry_parsed
+    ):
+        expiry_calculation_note = (
+            f"The label states {expiry_rule_months} months "
+            "from manufacture, but the manufacturing date "
+            "could not be identified reliably."
+        )
+
+    today = date.today()
     expired = None
-    if expiry_parsed is not None:
-        expired = expiry_parsed < datetime.now()
+    expiry_status = "Not detected"
 
-    # Simple confidence heuristic: found batch + found & parsed expiry = 1.0,
-    # found one of them = 0.5, found neither = 0.0.
-    # This is intentionally simple for the prototype — refine later if needed.
-    found_count = sum([batch_no is not None, expiry_parsed is not None])
-    confidence = found_count / 2.0
+    if expiry_parsed:
+        expired = expiry_parsed < today
+
+        if expired:
+            expiry_status = "expired"
+        else:
+            expiry_status = "not_expired"
+
+    fields_found = sum([
+        bool(batch_no),
+        bool(expiry_parsed),
+    ])
+
+    # This is field presence, not OCR accuracy.
+    field_indicator = fields_found / 2
 
     return {
         "raw_text": raw_text,
-        "normalized_text": normalized_text,
+        "normalized_text": normalized,
         "batch_no": batch_no,
         "expiry_raw": expiry_raw,
         "expiry_parsed": expiry_parsed,
-        "expiry_used_fallback": used_fallback,
+        "mfg_raw": mfg_raw,
+        "mfg_parsed": mfg_parsed,
+        "expiry_rule_months": expiry_rule_months,
+        "expiry_used_calculation": expiry_used_calculation,
+        "expiry_calculation_note": expiry_calculation_note,
+        "expiry_used_fallback": False,
         "expired": expired,
-        "confidence": confidence,
+        "expiry_status": expiry_status,
+        "confidence": field_indicator,
     }
 
 
-# ---------------------------------------------------------------------------
-# Standalone test runner — lets you check this file works on its own,
-# without needing the Streamlit app or the other two stages built yet.
-# ---------------------------------------------------------------------------
+# ============================================================
+# COMMAND-LINE TEST
+# ============================================================
+
 if __name__ == "__main__":
+    import sys
+
     if len(sys.argv) < 2:
-        print("Usage: py -3.12 src/stage3_ocr.py path/to/image.jpg")
-        sys.exit(1)
+        print(
+            'Usage: python src/stage3_ocr.py "path/to/image.jpg"'
+        )
+        raise SystemExit(1)
 
-    image_path = sys.argv[1]
-    print(f"Running OCR on: {image_path}\n")
+    result = run_ocr_check(sys.argv[1])
 
-    result = run_ocr_check(image_path)
-
-    print("Raw OCR text detected:")
-    print(" ", result["raw_text"])
-    print("Normalized text (used for matching):")
-    print(" ", result["normalized_text"])
-    print()
-    print("Batch number found:  ", result["batch_no"])
-    print("Expiry (raw match):  ", result["expiry_raw"])
-    print("Expiry (parsed):     ", result["expiry_parsed"])
-    print("Used fallback scan?  ", result["expiry_used_fallback"])
-    print("Expired?             ", result["expired"])
-    print("Confidence score:    ", result["confidence"])
+    for key, value in result.items():
+        print(f"{key}: {value}")
