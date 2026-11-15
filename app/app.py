@@ -1,3 +1,4 @@
+
 import os
 import sys
 import tempfile
@@ -97,6 +98,7 @@ uploaded_files = st.file_uploader(
 )
 
 if uploaded_files:
+
     for uploaded_file in uploaded_files:
         st.image(
             uploaded_file,
@@ -111,18 +113,22 @@ if uploaded_files:
     )
 
     if analyze_clicked:
+
         image_paths = []
         start_time = time.perf_counter()
 
         try:
+
             # Save all uploaded images temporarily
             for uploaded_file in uploaded_files:
+
                 suffix = os.path.splitext(uploaded_file.name)[1] or ".jpg"
 
                 with tempfile.NamedTemporaryFile(
                     delete=False,
                     suffix=suffix,
                 ) as temp_file:
+
                     temp_file.write(uploaded_file.getvalue())
                     image_paths.append(temp_file.name)
 
@@ -133,6 +139,7 @@ if uploaded_files:
             with st.spinner(
                 "Reading text from all package photos and analyzing the image..."
             ):
+
                 # Run OCR on every uploaded photo
                 ocr_start = time.perf_counter()
 
@@ -143,8 +150,8 @@ if uploaded_files:
 
                 ocr_seconds = time.perf_counter() - ocr_start
 
-                # Start with the first OCR result to preserve
-                # the original result structure
+                # Start with first OCR result
+                # to preserve the original result structure
                 ocr = dict(ocr_results[0]) if ocr_results else {}
 
                 # Combine readable text from all photos
@@ -161,30 +168,79 @@ if uploaded_files:
                 ]
 
                 ocr["raw_text"] = "\n\n".join(raw_text_parts)
+
                 ocr["normalized_text"] = "\n\n".join(
                     normalized_text_parts
                 )
 
-                # Use the first available extracted value for each field.
-                # If photos disagree, manually verify the package.
+                # --------------------------------------
+                # MULTI-IMAGE OCR CONFLICT DETECTION
+                # --------------------------------------
+
                 fields_to_merge = (
                     "batch_no",
                     "expiry_raw",
                     "expiry_parsed",
                     "mfg_parsed",
                     "expiry_rule_months",
-                    "expiry_used_calculation",
-                    "expiry_status",
-                    "confidence",
                 )
 
+                field_conflicts = {}
+
                 for field in fields_to_merge:
+
+                    values = []
+
                     for result in ocr_results:
+
+                        value = result.get(field)
+
+                        if value not in (None, "", False):
+                            values.append(value)
+
+                    # Remove duplicate values while preserving order
+                    unique_values = list(dict.fromkeys(values))
+
+                    if len(unique_values) > 1:
+
+                        field_conflicts[field] = [
+                            str(value) for value in unique_values
+                        ]
+
+                        # Do not silently select one conflicting value
+                        ocr[field] = None
+
+                    elif unique_values:
+
+                        ocr[field] = unique_values[0]
+
+                    else:
+
+                        ocr[field] = None
+
+                # Save detected conflicts
+                ocr["field_conflicts"] = field_conflicts
+
+                # Preserve first available non-conflicting
+                # calculation and confidence information
+                for field in (
+                    "expiry_used_calculation",
+                    "confidence",
+                ):
+
+                    for result in ocr_results:
+
                         value = result.get(field)
 
                         if value not in (None, "", False):
                             ocr[field] = value
                             break
+
+                # If expiry information conflicts,
+                # do not report an expiry status
+                if "expiry_parsed" in field_conflicts:
+                    ocr["expiry_status"] = "conflict"
+                    ocr["expired"] = None
 
                 # Screen the combined OCR text
                 screening = screen_medicine_image(
@@ -197,6 +253,7 @@ if uploaded_files:
                 # Keep the existing CNN workflow.
                 # CNN prediction is based on the first uploaded photo only.
                 if screening.get("is_medicine_candidate", False):
+
                     cnn_start = time.perf_counter()
 
                     authenticity = run_authenticity_check(
@@ -218,7 +275,7 @@ if uploaded_files:
                 f"Analysis completed in {elapsed:.1f} seconds"
             )
 
-            # Actual timing measurements, not estimates.
+            # Actual timing measurements
             time_col1, time_col2 = st.columns(2)
 
             with time_col1:
@@ -236,6 +293,7 @@ if uploaded_files:
             st.subheader("1. Image screening")
 
             if screening.get("is_medicine_candidate", False):
+
                 st.success(
                     "Medicine-related text indicators detected."
                 )
@@ -245,12 +303,14 @@ if uploaded_files:
                 )
 
                 if indicators:
+
                     st.caption(
                         "Recognized indicators: "
                         + ", ".join(indicators[:12])
                     )
 
             else:
+
                 st.warning(
                     "Unable to verify the image from the readable text."
                 )
@@ -274,6 +334,7 @@ if uploaded_files:
             st.subheader("2. Experimental image-model output")
 
             if authenticity is None:
+
                 st.write("CNN prediction: Not run")
 
                 st.caption(
@@ -282,6 +343,7 @@ if uploaded_files:
                 )
 
             else:
+
                 label = authenticity.get(
                     "label", "Unavailable"
                 )
@@ -304,6 +366,7 @@ if uploaded_files:
                     )
 
                 if model_confidence is not None:
+
                     st.caption(
                         "Model-reported confidence: "
                         f"{model_confidence * 100:.1f}%"
@@ -324,6 +387,34 @@ if uploaded_files:
             st.subheader("3. Batch and expiry information")
 
             if screening.get("is_medicine_candidate", False):
+
+                # Display conflicting OCR values
+                if ocr.get("field_conflicts"):
+
+                    st.error(
+                        "Conflicting information detected across "
+                        "uploaded package photographs."
+                    )
+
+                    for field, values in ocr["field_conflicts"].items():
+
+                        display_name = field.replace("_", " ").title()
+
+                        st.write(f"**{display_name}:**")
+
+                        st.write(" / ".join(values))
+
+                    st.warning(
+                        "Please inspect the physical medicine package. "
+                        "Conflicting values are not treated as verified."
+                    )
+
+                else:
+
+                    st.success(
+                        "No conflicting values detected in the extracted fields."
+                    )
+
                 batch_no = ocr.get("batch_no")
                 expiry_raw = ocr.get("expiry_raw")
                 expiry_parsed = ocr.get("expiry_parsed")
@@ -333,20 +424,31 @@ if uploaded_files:
                 col1, col2 = st.columns(2)
 
                 with col1:
+
                     st.metric(
                         "Batch number",
                         str(batch_no)
                         if batch_no
-                        else "Not detected",
+                        else (
+                            "Conflicting values"
+                            if "batch_no" in ocr.get("field_conflicts", {})
+                            else "Not detected"
+                        ),
                     )
 
                 with col2:
+
                     displayed_expiry = expiry_raw
 
                     if not displayed_expiry and expiry_parsed:
+
                         displayed_expiry = expiry_parsed.strftime(
                             "%d %b %Y"
                         )
+
+                    if "expiry_parsed" in ocr.get("field_conflicts", {}):
+
+                        displayed_expiry = "Conflicting values"
 
                     st.metric(
                         "Expiry date",
@@ -356,18 +458,21 @@ if uploaded_files:
                     )
 
                 if mfg_parsed:
+
                     st.caption(
                         "Detected manufacturing date: "
                         f"{mfg_parsed.strftime('%b %Y')}"
                     )
 
                 if expiry_rule:
+
                     st.caption(
                         f"Printed expiry rule detected: "
                         f"{expiry_rule} months from manufacture."
                     )
 
                 if ocr.get("expiry_used_calculation"):
+
                     st.warning(
                         "Expiry was calculated from a detected manufacturing "
                         "date and printed duration. Verify it against the package."
@@ -379,24 +484,35 @@ if uploaded_files:
                 )
 
                 if expiry_status == "expired":
+
                     st.warning(
                         "The extracted expiry date appears to be in the past. "
                         "Check the printed date manually."
                     )
 
                 elif expiry_status == "not_expired":
+
                     st.info(
                         "The extracted date is not in the past. "
                         "This does not establish product safety."
                     )
 
+                elif expiry_status == "conflict":
+
+                    st.error(
+                        "Expiry status cannot be determined because "
+                        "different photographs produced conflicting dates."
+                    )
+
                 else:
+
                     st.warning(
                         "Expiry status unknown. No reliable expiry date "
                         "was extracted."
                     )
 
                 if not batch_no or not expiry_parsed:
+
                     st.caption(
                         "Missing fields may be printed elsewhere on the "
                         "package, including the crimp."
@@ -405,6 +521,7 @@ if uploaded_files:
                 field_indicator = ocr.get("confidence")
 
                 if field_indicator is not None:
+
                     st.caption(
                         "OCR field-extraction indicator: "
                         f"{field_indicator * 100:.0f}% "
@@ -412,6 +529,7 @@ if uploaded_files:
                     )
 
             else:
+
                 st.info(
                     "Batch and expiry details are not presented as verified "
                     "because the initial text screen did not pass."
@@ -441,12 +559,14 @@ if uploaded_files:
             # --------------------------------------
 
             with st.expander("Advanced diagnostics · OCR details"):
+
                 raw_text = ocr.get("raw_text", "")
                 normalized_text = ocr.get("normalized_text", "")
 
                 st.markdown("**Extracted OCR text**")
 
                 if raw_text.strip():
+
                     st.text_area(
                         "Raw OCR",
                         value=raw_text,
@@ -457,6 +577,7 @@ if uploaded_files:
                     )
 
                 else:
+
                     st.caption(
                         "No readable text was extracted."
                     )
@@ -466,6 +587,7 @@ if uploaded_files:
                 )
 
                 if normalized_text.strip():
+
                     st.text_area(
                         "Normalized OCR",
                         value=normalized_text,
@@ -476,6 +598,7 @@ if uploaded_files:
                     )
 
                 else:
+
                     st.caption(
                         "No normalized text is available."
                     )
@@ -487,6 +610,7 @@ if uploaded_files:
                 )
 
         except Exception as error:
+
             st.error(f"Analysis failed: {error}")
 
             st.caption(
@@ -494,10 +618,14 @@ if uploaded_files:
             )
 
         finally:
+
             # Delete all temporary images
             for image_path in image_paths:
+
                 if os.path.exists(image_path):
+
                     try:
                         os.remove(image_path)
+
                     except OSError:
                         pass
